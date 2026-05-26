@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.idea/
+edge_sharepoint_profile/
+output/downloads/
+output/screenshots/
+output/debug/
+output/properties_inspect/
