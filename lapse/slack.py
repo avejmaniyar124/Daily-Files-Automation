@@ -93,6 +93,8 @@ def build_missing_files_message(
                 f"Downloaded: {len(downloaded_suffixes)}/{total_expected} file type(s).",
                 "Zip archives were created with whatever files were available.",
             ]
+
+
         )
 
     lines.append("")
