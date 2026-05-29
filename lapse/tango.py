@@ -28,12 +28,12 @@ WORKFLOW_URL = f"{BASE_URL}/web/tango/pdf-workflow-approval"
 IST = timezone(timedelta(hours=5, minutes=30))
 
 BILLING_SUFFIXES = ("NASULFGRCLETTER", "NASULFFLPSLETTER")
-LETTERS_SUFFIXES = ("NASUANCMDLETTER", "ANNUITYMLTLRLETTER", "NASUSCHLTRLETTER", "NASULIFEMLTLRLETTER")
+LETTERS_SUFFIXES = ("NASUANCMDLETTER", "NASUANNUITYMLTLRLETTER", "NASUSCHLTRLETTER", "NASULIFEMLTLRLETTER")
 ALL_SUFFIXES = BILLING_SUFFIXES + LETTERS_SUFFIXES
 
 DEFAULT_POLL_INTERVAL_MINUTES = 30
 DEFAULT_READY_HOUR = 16
-DEFAULT_READY_MINUTE = 30
+DEFAULT_READY_MINUTE = 00
 DEFAULT_POLL_END_HOUR = 23
 DEFAULT_POLL_END_MINUTE = 59
 
@@ -69,6 +69,9 @@ class DownloadState:
 
     def all_found(self, suffixes: tuple[str, ...]) -> bool:
         return not self.missing(suffixes)
+
+    def any_found(self, suffixes: tuple[str, ...]) -> bool:
+        return any(self.has_suffix(s) for s in suffixes)
 
 
 def previous_us_business_day(from_date: date | None = None) -> tuple[date, str]:
@@ -337,6 +340,15 @@ def poll_for_files(
             log.info("All file types downloaded.")
             break
 
+        if state.any_found(target_suffixes):
+            downloaded = len(target_suffixes) - len(state.missing(target_suffixes))
+            log.info(
+                "Proceeding with %d/%d file type(s) — zipping and uploading available files.",
+                downloaded,
+                len(target_suffixes),
+            )
+            break
+
         current = now_ist()
         if current >= deadline:
             log.warning(
@@ -565,14 +577,26 @@ def main() -> int:
         _send_slack_alerts(result)
 
     if not args.no_sharepoint:
-        _upload_to_sharepoint(result, headless=not args.headed)
+        uploaded = _upload_to_sharepoint(result, headless=not args.headed)
+    else:
+        uploaded = False
 
     print("\nResults:")
-    if result.billing_zip:
-        print(f"  Billing: {result.billing_zip.resolve()}")
-    if result.letters_zip:
-        print(f"  Letters: {result.letters_zip.resolve()}")
+    for label, zip_path in (
+        ("Billing", result.billing_zip),
+        ("Letters", result.letters_zip),
+    ):
+        if not zip_path:
+            continue
+        display_path = _archived_zip_path(zip_path) if uploaded else zip_path
+        if display_path.exists():
+            print(f"  {label}: {display_path.resolve()}")
     return 0
+
+
+def _archived_zip_path(zip_path: Path) -> Path:
+    archived = zip_path.parent / "Archive" / zip_path.name
+    return archived if archived.exists() else zip_path
 
 
 def _run_sharepoint_only(*, headless: bool) -> int:
@@ -614,22 +638,19 @@ def _run_sharepoint_only(*, headless: bool) -> int:
 def _upload_to_sharepoint(result: RunResult, *, headless: bool) -> bool:
     try:
         from sharepoint_upload import (
-            is_sharepoint_configured,
+            archive_uploaded_zips,
             print_sharepoint_setup_error,
             print_upload_summary,
             upload_from_run_result,
         )
 
-        if not is_sharepoint_configured():
-            print_sharepoint_setup_error()
-            return False
-
+        files = [
+            f for f in (result.billing_zip, result.letters_zip) if f and f.exists()
+        ]
         ok, screenshot = upload_from_run_result(result, headless=headless)
         if ok:
-            files = [
-                f for f in (result.billing_zip, result.letters_zip) if f and f.exists()
-            ]
             print_upload_summary(files, screenshot=screenshot)
+            archive_uploaded_zips(files)
         return ok
     except Exception:
         log.exception("Failed to upload files to SharePoint.")

@@ -1,14 +1,9 @@
 """
 SharePoint upload automation for NASU billing and letters zip files.
 
-Uses Microsoft Edge with a saved browser profile so your normal Windows / SSO
-login is reused — no email or password in .env is required.
-
-One-time setup:
-  py sharepoint_upload.py --save-login
-
-Sign in once in the Edge window (same as when you open SharePoint manually).
-The session is saved locally and reused on every run.
+Uses Microsoft Edge with a saved browser profile (edge_sharepoint_profile/).
+On first upload, save-login runs automatically — sign in once with your normal
+work SSO when the browser opens. All later runs reuse the saved session.
 """
 
 from __future__ import annotations
@@ -18,6 +13,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -188,20 +184,55 @@ def _find_file_row_in_group(
     return _find_row_in_current_view(page, pattern)
 
 
-def is_sharepoint_configured() -> bool:
-    """True when a saved Edge profile exists from --save-login."""
+def _optional_ms365_credentials() -> tuple[str, str] | tuple[None, None]:
+    """Email/password from .env when both are set."""
+    email = os.environ.get("MS365_EMAIL", "").strip()
+    password = os.environ.get("MS365_PASSWORD", "").strip()
+    if email and password:
+        return email, password
+    return None, None
+
+
+def has_ms365_credentials() -> bool:
+    email, password = _optional_ms365_credentials()
+    return bool(email and password)
+
+
+def _saved_edge_profile_exists() -> bool:
     if not EDGE_PROFILE_DIR.exists():
         return False
     return any(EDGE_PROFILE_DIR.iterdir())
 
 
+def is_sharepoint_configured() -> bool:
+    """True when a saved Edge browser profile exists."""
+    return _saved_edge_profile_exists()
+
+
 def print_sharepoint_setup_error() -> None:
     print(
-        "\nERROR: SharePoint login not saved.\n"
-        "Run this once and sign in with your work account in the browser:\n"
-        "  py sharepoint_upload.py --save-login\n",
+        "\nERROR: SharePoint login could not be saved.\n"
+        "When the Edge browser opens, sign in with your normal work account.\n"
+        "The session is saved locally and reused on all future runs.\n",
         file=sys.stderr,
     )
+
+
+def ensure_sharepoint_session(*, headless: bool | None = None) -> None:
+    """
+    Run save-login automatically when no Edge profile exists yet.
+
+    Opens Edge so you can sign in with your work SSO once. No credentials
+    are stored in .env — the session lives in edge_sharepoint_profile/.
+    """
+    if _saved_edge_profile_exists():
+        return
+
+    log.info(
+        "No saved SharePoint session — running save-login automatically. "
+        "Sign in with your work account when the browser opens."
+    )
+    save_sharepoint_session(headless=False)
 
 
 def get_sharepoint_url() -> str:
@@ -224,13 +255,25 @@ def print_upload_summary(
         print(f"\nScreenshot saved:\n  {screenshot.resolve()}")
 
 
-def _optional_ms365_credentials() -> tuple[str, str] | tuple[None, None]:
-    """Email/password only if explicitly set in .env (optional fallback)."""
-    email = os.environ.get("MS365_EMAIL", "").strip()
-    password = os.environ.get("MS365_PASSWORD", "").strip()
-    if email and password:
-        return email, password
-    return None, None
+def archive_uploaded_zips(zip_paths: list[Path]) -> list[Path]:
+    """Move uploaded zip files into an Archive folder next to the zips."""
+    existing = [path for path in zip_paths if path and path.exists()]
+    if not existing:
+        return []
+
+    archive_dir = existing[0].parent / "Archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    archived: list[Path] = []
+    for zip_path in existing:
+        destination = archive_dir / zip_path.name
+        if destination.exists():
+            destination.unlink()
+        zip_path.rename(destination)
+        archived.append(destination)
+        log.info("Archived %s to %s", zip_path.name, archive_dir.resolve())
+
+    return archived
 
 
 def _launch_edge_context(playwright, *, headless: bool) -> BrowserContext:
@@ -247,36 +290,179 @@ def _launch_edge_context(playwright, *, headless: bool) -> BrowserContext:
         return playwright.chromium.launch_persistent_context(**kwargs)
 
 
-def dismiss_stay_signed_in(page: Page) -> None:
+def dismiss_stay_signed_in(page: Page) -> bool:
+    """Click Yes/No on 'Stay signed in?' — prefer Yes to keep the session."""
     for label in ("Yes", "No"):
         btn = page.get_by_role("button", name=label)
         if btn.count() and btn.first.is_visible():
             btn.first.click()
             page.wait_for_timeout(1500)
-            break
+            log.info("Answered 'Stay signed in?' with %s.", label)
+            return True
+    return False
+
+
+def _detect_mfa_or_blocked_login(page: Page) -> None:
+    """Raise when Microsoft requires MFA or manual approval."""
+    patterns = (
+        r"approve\s+sign[\s-]?in",
+        r"enter\s+code",
+        r"verify\s+your\s+identity",
+        r"microsoft\s+authenticator",
+        r"use\s+your\s+password\s+or\s+approved\s+device",
+        r"we\s+sent\s+a\s+code",
+        r"phone\s+sign[\s-]?in",
+        r"enter\s+the\s+code",
+    )
+    for root in _iter_page_roots(page):
+        for pattern in patterns:
+            try:
+                matches = root.get_by_text(re.compile(pattern, re.I))
+                for i in range(min(matches.count(), 5)):
+                    if matches.nth(i).is_visible():
+                        raise RuntimeError(
+                            "Microsoft login requires MFA or manual approval, which "
+                            "cannot be automated. Use an app password in MS365_PASSWORD, "
+                            "or complete py sharepoint_upload.py --save-login once."
+                        )
+            except RuntimeError:
+                raise
+            except Exception:
+                continue
+
+
+def _try_select_account(page: Page, email: str) -> bool:
+    """Pick the work account on Microsoft's account chooser screen."""
+    local_part = email.split("@", 1)[0]
+
+    for root in _iter_page_roots(page):
+        for pattern in (email, local_part):
+            try:
+                matches = root.get_by_text(re.compile(re.escape(pattern), re.I))
+                for i in range(min(matches.count(), 8)):
+                    candidate = matches.nth(i)
+                    if candidate.is_visible():
+                        candidate.click()
+                        page.wait_for_timeout(1500)
+                        log.info("Selected Microsoft account for %s.", email)
+                        return True
+            except Exception:
+                continue
+
+        for label in ("Use another account", "Sign in with another account"):
+            try:
+                link = root.get_by_text(label, exact=False)
+                if link.count() and link.first.is_visible():
+                    link.first.click()
+                    page.wait_for_timeout(1500)
+                    log.info("Opened '%s' on account picker.", label)
+                    return True
+            except Exception:
+                continue
+
+    return False
+
+
+def _submit_login_form(page: Page) -> bool:
+    for selector in ("#idSIButton9", "input[type='submit']", "button[type='submit']"):
+        btn = page.locator(selector).first
+        try:
+            if btn.count() and btn.is_visible():
+                btn.click()
+                page.wait_for_timeout(2000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _complete_microsoft_login(
+    page: Page,
+    email: str,
+    password: str,
+    *,
+    timeout_ms: int = 120_000,
+) -> None:
+    """Walk through Microsoft login screens until authenticated or blocked."""
+    log.info("Signing in to Microsoft 365 as %s...", email)
+    deadline = time.monotonic() + timeout_ms / 1000
+    password_entered = False
+
+    while time.monotonic() < deadline:
+        if not _needs_login(page):
+            log.info("Microsoft sign-in complete.")
+            return
+
+        _detect_mfa_or_blocked_login(page)
+
+        if _try_select_account(page, email):
+            continue
+
+        email_input = page.locator(
+            "#i0116, input[name='loginfmt'], input[type='email']"
+        ).first
+        if email_input.count():
+            try:
+                if email_input.is_visible():
+                    current = (email_input.input_value() or "").strip()
+                    if current.lower() != email.lower():
+                        email_input.fill(email)
+                    if _submit_login_form(page):
+                        continue
+            except Exception:
+                pass
+
+        pwd_input = page.locator(
+            "#i0118, input[name='passwd'], input[type='password']"
+        ).first
+        if pwd_input.count() and not password_entered:
+            try:
+                if pwd_input.is_visible():
+                    pwd_input.fill(password)
+                    password_entered = True
+                    if _submit_login_form(page):
+                        continue
+            except Exception:
+                pass
+
+        if dismiss_stay_signed_in(page):
+            continue
+
+        page.wait_for_timeout(1000)
+
+    if _needs_login(page):
+        raise RuntimeError(
+            "Microsoft login did not complete in time. "
+            "Sign in with your work account when the browser opens."
+        )
 
 
 def microsoft_login(page: Page, email: str, password: str) -> None:
-    log.info("Signing in to Microsoft 365...")
-    page.wait_for_selector("#i0116, input[type='email']", timeout=60_000)
-    email_input = page.locator("#i0116").or_(page.locator("input[type='email']")).first
-    email_input.fill(email)
-    page.locator("#idSIButton9, input[type='submit']").first.click()
-    page.wait_for_timeout(2000)
-
-    page.wait_for_selector("#i0118, input[type='password']", timeout=60_000)
-    page.locator("#i0118").or_(page.locator("input[type='password']")).first.fill(password)
-    page.locator("#idSIButton9, input[type='submit']").first.click()
-    page.wait_for_timeout(3000)
-    dismiss_stay_signed_in(page)
+    _complete_microsoft_login(page, email, password)
 
 
 def _needs_login(page: Page) -> bool:
-    return (
-        "login.microsoftonline.com" in page.url
-        or "login.live.com" in page.url
-        or page.locator("#i0116, input[type='email']").count() > 0
-    )
+    url = page.url.lower()
+    if any(
+        host in url
+        for host in (
+            "login.microsoftonline.com",
+            "login.live.com",
+            "login.microsoft.com",
+            "accounts.microsoft.com",
+        )
+    ):
+        return True
+
+    for selector in ("#i0116", "input[name='loginfmt']", "input[type='email']"):
+        loc = page.locator(selector).first
+        try:
+            if loc.count() and loc.is_visible():
+                return True
+        except Exception:
+            continue
+
+    return False
 
 
 def open_sharepoint_library(
@@ -284,8 +470,12 @@ def open_sharepoint_library(
     *,
     email: str | None = None,
     password: str | None = None,
-    login_timeout_ms: int = 60_000,
+    allow_manual_login: bool = False,
+    login_timeout_ms: int = 300_000,
 ) -> None:
+    if email is None or password is None:
+        email, password = _optional_ms365_credentials()
+
     url = get_sharepoint_url()
     log.info("Opening SharePoint library...")
     page.goto(url, wait_until="domcontentloaded", timeout=120_000)
@@ -293,11 +483,17 @@ def open_sharepoint_library(
 
     if _needs_login(page):
         if email and password:
+            if not _saved_edge_profile_exists():
+                log.info(
+                    "No saved Edge profile yet — signing in automatically and "
+                    "saving session to %s.",
+                    EDGE_PROFILE_DIR.resolve(),
+                )
             microsoft_login(page, email, password)
             page.goto(url, wait_until="networkidle", timeout=120_000)
-        else:
+        elif allow_manual_login:
             log.info(
-                "Waiting for you to sign in via SSO in the browser (up to %d seconds)...",
+                "Waiting for manual sign-in in the browser (up to %d seconds)...",
                 login_timeout_ms // 1000,
             )
             for _ in range(login_timeout_ms // 2000):
@@ -306,12 +502,14 @@ def open_sharepoint_library(
                 page.wait_for_timeout(2000)
             if _needs_login(page):
                 raise RuntimeError(
-                    "SharePoint sign-in required. Run once:\n"
-                    "  py sharepoint_upload.py --save-login\n"
-                    "Sign in with your normal work account in the Edge window. "
-                    "No email/password is needed in .env."
+                    "SharePoint sign-in timed out. Sign in with your work account "
+                    "when the browser opens."
                 )
             page.goto(url, wait_until="networkidle", timeout=120_000)
+        else:
+            raise RuntimeError(
+                "SharePoint sign-in required. Complete sign-in when the browser opens."
+            )
 
     page.wait_for_timeout(3000)
     _wait_for_library_ready(page)
@@ -1980,7 +2178,10 @@ def screenshot_sharepoint_library(
     highlight_files: list[Path] | None = None,
 ) -> Path | None:
     """Open SharePoint and save a full-page screenshot (no upload)."""
-    if not is_sharepoint_configured():
+    try:
+        ensure_sharepoint_session(headless=headless)
+    except Exception:
+        log.exception("Automatic SharePoint save-login failed.")
         print_sharepoint_setup_error()
         return None
 
@@ -1999,14 +2200,15 @@ def screenshot_sharepoint_library(
     return output_path
 
 
-def save_sharepoint_session(*, headless: bool = False) -> None:
+def save_sharepoint_session(*, headless: bool | None = None) -> None:
     """
-    Open SharePoint in Edge and save your login profile locally.
+    Open SharePoint in Edge and save the login profile locally.
 
-    Use your normal work sign-in (Windows SSO / company account).
-    MS365_EMAIL and MS365_PASSWORD in .env are NOT required.
+    Uses your normal work SSO sign-in in the browser — nothing is stored in .env.
     """
     email, password = _optional_ms365_credentials()
+    if headless is None:
+        headless = bool(email and password)
 
     with sync_playwright() as playwright:
         context = _launch_edge_context(playwright, headless=headless)
@@ -2016,9 +2218,10 @@ def save_sharepoint_session(*, headless: bool = False) -> None:
                 page,
                 email=email,
                 password=password,
+                allow_manual_login=True,
                 login_timeout_ms=300_000,
             )
-            log.info("SharePoint session saved in %s", EDGE_PROFILE_DIR)
+            log.info("SharePoint session saved in %s", EDGE_PROFILE_DIR.resolve())
         finally:
             context.close()
 
@@ -2036,7 +2239,10 @@ def upload_files_to_sharepoint(
         log.warning("No files to upload to SharePoint.")
         return False, None
 
-    if not is_sharepoint_configured():
+    try:
+        ensure_sharepoint_session(headless=headless)
+    except Exception:
+        log.exception("Automatic SharePoint save-login failed.")
         print_sharepoint_setup_error()
         return False, None
 
@@ -2048,7 +2254,12 @@ def upload_files_to_sharepoint(
         page = context.pages[0] if context.pages else context.new_page()
 
         try:
-            open_sharepoint_library(page, email=email, password=password)
+            open_sharepoint_library(
+                page,
+                email=email,
+                password=password,
+                allow_manual_login=True,
+            )
 
             for file_path in existing:
                 upload_and_configure_file(page, file_path)
@@ -2084,10 +2295,6 @@ def upload_from_run_result(
         log.warning("No zip files available for SharePoint upload.")
         return False, None
 
-    if not is_sharepoint_configured():
-        print_sharepoint_setup_error()
-        return False, None
-
     return upload_files_to_sharepoint(files, headless=headless)
 
 
@@ -2109,7 +2316,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-login",
         action="store_true",
-        help="Sign in once in Edge and save session (no .env password needed).",
+        help="Sign in via Edge and save session to edge_sharepoint_profile/ (also runs automatically on first upload).",
     )
     parser.add_argument(
         "--screenshot-only",
@@ -2156,7 +2363,7 @@ def main() -> int:
             log.exception("Failed to save SharePoint login session.")
             return 1
         print(f"\nSession saved in {EDGE_PROFILE_DIR.resolve()}")
-        print("Future runs will reuse this login — no email/password in .env needed.")
+        print("Future runs will reuse this saved browser session — no .env credentials needed.")
         return 0
 
     if args.screenshot_only:
@@ -2176,7 +2383,10 @@ def main() -> int:
         return 0
 
     if args.inspect_properties:
-        if not is_sharepoint_configured():
+        try:
+            ensure_sharepoint_session(headless=not args.headed)
+        except Exception:
+            log.exception("Automatic SharePoint save-login failed.")
             print_sharepoint_setup_error()
             return 2
         output = Path("output")
@@ -2205,7 +2415,10 @@ def main() -> int:
         return 0
 
     if args.properties_only:
-        if not is_sharepoint_configured():
+        try:
+            ensure_sharepoint_session(headless=not args.headed)
+        except Exception:
+            log.exception("Automatic SharePoint save-login failed.")
             print_sharepoint_setup_error()
             return 2
         output = Path("output")
@@ -2260,6 +2473,7 @@ def main() -> int:
         return 2
 
     print_upload_summary(files, screenshot=screenshot)
+    archive_uploaded_zips(files)
     return 0
 
 
